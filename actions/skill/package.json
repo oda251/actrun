@@ -1,0 +1,13 @@
+{
+  "name": "actrun-skill-step",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "bun build src/index.ts --outdir dist --target node"
+  },
+  "dependencies": {
+    "@anthropic-ai/claude-agent-sdk": "^0.2.87",
+    "gray-matter": "^4.0.3",
+    "neverthrow": "^8.2.0"
+  }
+}

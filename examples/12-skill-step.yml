@@ -1,0 +1,37 @@
+name: Skill Step Example
+on: workflow_dispatch
+
+jobs:
+  implement:
+    runs-on: local
+    steps:
+      - uses: ./actions/skill
+        id: impl
+        with:
+          skill: dev/impl
+          inputs: |
+            {
+              "what": { "type": "evidenced", "body": "Add JWT auth middleware", "citations": [{ "type": "uri", "source": "src/auth/session.ts", "excerpt": "app.use(session(...))" }] },
+              "where": { "type": "plain", "value": "src/auth/" }
+            }
+
+      - uses: ./actions/skill
+        with:
+          skill: dev/review
+          inputs: '${{ steps.impl.outputs.result }}'
+
+  lint:
+    runs-on: local
+    steps:
+      - run: bun run lint
+
+  test:
+    runs-on: local
+    steps:
+      - run: bun test
+
+  integrate:
+    needs: [implement, lint, test]
+    runs-on: local
+    steps:
+      - run: echo "All checks passed"

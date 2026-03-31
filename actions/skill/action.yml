@@ -1,0 +1,12 @@
+name: Skill Step
+description: Execute an AI agent skill — built-in actrun step type
+inputs:
+  skill:
+    description: Skill file path relative to .claude/skills/ (e.g. dev/impl)
+    required: true
+  inputs:
+    description: JSON-encoded task inputs
+    required: true
+runs:
+  using: node20
+  main: dist/index.js

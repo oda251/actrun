@@ -1,0 +1,28 @@
+name: Implement and review
+on: workflow_dispatch
+
+jobs:
+  implement:
+    runs-on: local
+    steps:
+      - uses: ./actions/skill
+        id: impl
+        with:
+          skill: dev/impl
+          inputs: '${{ toJSON(inputs) }}'
+
+      - uses: ./actions/skill
+        with:
+          skill: dev/review
+          inputs: '{"changes": "${{ steps.impl.outputs.changes }}"}'
+
+  lint:
+    runs-on: local
+    steps:
+      - run: bun run lint
+
+  integrate:
+    needs: [implement, lint]
+    runs-on: local
+    steps:
+      - run: echo "All checks passed"

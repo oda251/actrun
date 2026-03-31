@@ -232,6 +232,7 @@ fn usage_text() -> String {
   "  viz <workflow.yml> --mermaid Output Mermaid diagram text\n" +
   "  viz <workflow.yml> --detail  Output Mermaid with step-level subgraphs\n" +
   "  viz <workflow.yml> --svg     Output SVG (--theme github-dark|github-light|...)\n" +
+  "  inspect <workflow.yml>       Show required external inputs as JSON\n" +
   "  export <workflow.yml>        Convert workflow to shell script (experimental)\n" +
   "  export <workflow.yml> --job <id>  Export a single job\n" +
   "  export <workflow.yml> --parallel  Parallelize independent jobs with & and wait\n" +
@@ -4257,6 +4258,195 @@ fn print_errors(errors : Array[String]) -> Unit {
 }
 
 ///|
+///|
+fn parse_skill_frontmatter_inputs(content : String) -> Map[String, String] {
+  let inputs : Map[String, String] = {}
+  // Find frontmatter between --- markers
+  let first = content.find("---")
+  guard first is Some(start) else { return inputs }
+  let after_first = start + 3
+  let rest = String::unsafe_substring(content, start=after_first, end=content.length())
+  let second = rest.find("---")
+  guard second is Some(end) else { return inputs }
+  let yaml = String::unsafe_substring(rest, start=0, end=end)
+  // Find inputs: section and parse keys
+  let mut in_inputs = false
+  let mut last_key : String = ""
+  for line in yaml.split("\n") {
+    let trimmed = line.trim(chars=" \t\r").to_string()
+    if trimmed == "inputs:" {
+      in_inputs = true
+      continue
+    }
+    if in_inputs {
+      if line.has_prefix("  ") && not(line.has_prefix("    ")) {
+        let key_line = trimmed
+        let colon = key_line.find(":")
+        match colon {
+          Some(ci) => {
+            let key = String::unsafe_substring(key_line, start=0, end=ci).trim(chars=" \t").to_string()
+            let val = String::unsafe_substring(key_line, start=ci + 1, end=key_line.length()).trim(chars=" \t").to_string()
+            let input_type : String = if val.length() > 0 { "evidenced" } else { "unknown" }
+            inputs[key] = input_type
+            last_key = key
+          }
+          None => ()
+        }
+      } else if not(line.has_prefix("  ")) && trimmed.length() > 0 {
+        in_inputs = false
+      }
+      if line.has_prefix("    ") && trimmed.has_prefix("type:") {
+        let type_val = String::unsafe_substring(trimmed, start=5, end=trimmed.length()).trim(chars=" \t").to_string()
+        if last_key.length() > 0 {
+          inputs[last_key] = type_val
+        }
+      }
+    }
+  }
+  inputs
+}
+
+///|
+fn read_ident(s : String, start : Int) -> String {
+  let mut end = start
+  while end < s.length() {
+    let ch = s[end]
+    if (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_' || ch == '-' {
+      end += 1
+    } else {
+      break
+    }
+  }
+  String::unsafe_substring(s, start=start, end=end)
+}
+
+fn extract_step_output_refs(workflow : @ar.WorkflowSpec) -> Map[String, Bool] {
+  // Collect all keys referenced as ${{ steps.<id>.outputs.<key> }}
+  let supplied : Map[String, Bool] = {}
+  for job in workflow.jobs {
+    for step in job.steps {
+      for entry in step.with_values {
+        let val = entry.1
+        let mut pos = 0
+        while pos < val.length() {
+          let rest = String::unsafe_substring(val, start=pos, end=val.length())
+          let marker = rest.find("steps.")
+          match marker {
+            Some(mi) => {
+              let after_steps = mi + 6
+              let step_id = read_ident(rest, after_steps)
+              let after_id = after_steps + step_id.length()
+              let remaining = String::unsafe_substring(rest, start=after_id, end=rest.length())
+              if remaining.has_prefix(".outputs.") {
+                let key = read_ident(remaining, 9)
+                if key.length() > 0 {
+                  supplied[key] = true
+                }
+                pos += after_id + 9 + key.length()
+              } else {
+                pos += after_id
+              }
+            }
+            None => break
+          }
+        }
+      }
+    }
+  }
+  supplied
+}
+
+///|
+fn handle_inspect_command(cli_args : Array[String]) -> Int {
+  if cli_args.length() < 3 {
+    println("Usage: actrun inspect <workflow.yml> [--skills-dir <path>]")
+    return 1
+  }
+  let path = cli_args[2]
+  let text = match read_text(path) {
+    Some(content) => content
+    None => {
+      println("error: failed to read " + path)
+      return 1
+    }
+  }
+  let parsed = @ar.parse_workflow_yaml(text)
+  if parsed.errors.length() > 0 {
+    for err in parsed.errors {
+      println("error: " + err)
+    }
+    return 1
+  }
+  guard parsed.workflow is Some(workflow) else {
+    println("error: failed to parse workflow")
+    return 1
+  }
+
+  // Parse --skills-dir option
+  let mut skills_dir = ".claude/skills"
+  let mut i = 3
+  while i < cli_args.length() {
+    if cli_args[i] == "--skills-dir" && i + 1 < cli_args.length() {
+      skills_dir = cli_args[i + 1]
+      i += 2
+    } else {
+      i += 1
+    }
+  }
+
+  // Collect all skill inputs from skill .md files
+  let all_inputs : Map[String, String] = {}
+  for job in workflow.jobs {
+    for step in job.steps {
+      match step.uses {
+        Some(uses) => {
+          if uses.contains("actions/skill") {
+            let skill_name = step.with_values.get("skill").unwrap_or("")
+            if skill_name.length() > 0 {
+              let skill_path = join_path(skills_dir, skill_name + ".md")
+              let skill_text = read_text(skill_path)
+              match skill_text {
+                Some(content) => {
+                  let skill_inputs = parse_skill_frontmatter_inputs(content)
+                  for entry in skill_inputs {
+                    if not(all_inputs.contains(entry.0)) {
+                      all_inputs[entry.0] = entry.1
+                    }
+                  }
+                }
+                None => ()
+              }
+            }
+          }
+        }
+        None => ()
+      }
+    }
+  }
+
+  // Find inputs supplied by step output references
+  let supplied = extract_step_output_refs(workflow)
+
+  // Build required inputs (not supplied by wiring)
+  let required_inputs : Array[Json] = []
+  for entry in all_inputs {
+    if not(supplied.contains(entry.0)) {
+      let obj : Map[String, Json] = {}
+      obj["key"] = Json::string(entry.0)
+      obj["type"] = Json::string(entry.1)
+      required_inputs.push(Json::object(obj))
+    }
+  }
+
+  let output : Map[String, Json] = {}
+  output["name"] = Json::string(workflow.name)
+  output["path"] = Json::string(path)
+  output["required_inputs"] = Json::array(required_inputs)
+  println(Json::object(output).stringify(indent=2))
+  0
+}
+
+///|
 fn handle_export_command(cli_args : Array[String]) -> Int {
   if cli_args.length() < 3 {
     println("Usage: actrun export <workflow.yml> [--job <id>]")
@@ -7762,6 +7952,14 @@ async fn main {
       @xsys.exit(1)
     }
     let exit_code = handle_cache_read_command(cache_options)
+    if exit_code != 0 {
+      @xsys.exit(exit_code)
+    }
+    return
+  }
+
+  if cli_args.length() > 1 && cli_args[1] == "inspect" {
+    let exit_code = handle_inspect_command(cli_args)
     if exit_code != 0 {
       @xsys.exit(exit_code)
     }

@@ -3513,3 +3513,186 @@ test "security: glob_match rejects path traversal patterns" {
     content="false",
   )
 }
+
+///|
+test "inspect: parse skill frontmatter with shorthand inputs" {
+  let content =
+    #|---
+    #|inputs:
+    #|  what: Implementation details
+    #|  where: Target file
+    #|---
+    #|
+    #|Do the work.
+  let inputs = parse_skill_frontmatter_inputs(content)
+  inspect(inputs.size(), content="2")
+  inspect(inputs.get("what"), content="Some(\"evidenced\")")
+  inspect(inputs.get("where"), content="Some(\"evidenced\")")
+}
+
+///|
+test "inspect: parse skill frontmatter with typed inputs" {
+  let content =
+    #|---
+    #|inputs:
+    #|  what: Implementation details
+    #|  where:
+    #|    description: Target file
+    #|    type: plain
+    #|---
+    #|
+    #|Do the work.
+  let inputs = parse_skill_frontmatter_inputs(content)
+  inspect(inputs.size(), content="2")
+  inspect(inputs.get("what"), content="Some(\"evidenced\")")
+  inspect(inputs.get("where"), content="Some(\"plain\")")
+}
+
+///|
+test "inspect: parse skill frontmatter with no inputs" {
+  let content =
+    #|---
+    #|provider: claude
+    #|model: sonnet
+    #|---
+    #|
+    #|Just do it.
+  let inputs = parse_skill_frontmatter_inputs(content)
+  inspect(inputs.size(), content="0")
+}
+
+///|
+test "inspect: parse skill frontmatter with no frontmatter" {
+  let content = "Just a plain markdown file."
+  let inputs = parse_skill_frontmatter_inputs(content)
+  inspect(inputs.size(), content="0")
+}
+
+///|
+test "inspect: parse skill frontmatter with empty inputs" {
+  let content =
+    #|---
+    #|inputs:
+    #|provider: claude
+    #|---
+    #|
+    #|Work.
+  let inputs = parse_skill_frontmatter_inputs(content)
+  inspect(inputs.size(), content="0")
+}
+
+///|
+test "inspect: extract step output refs from workflow" {
+  let text = "name: Test\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - uses: ./actions/skill\n        id: impl\n        with:\n          skill: dev/impl\n          inputs: data\n      - uses: ./actions/skill\n        with:\n          skill: dev/review\n          inputs: '{\"changes\": \"${{ steps.impl.outputs.changes }}\"}'\n"
+  let parsed = @ar.parse_workflow_yaml(text)
+  guard parsed.workflow is Some(workflow) else {
+    abort("failed to parse: " + parsed.errors.join(", "))
+  }
+  let refs = extract_step_output_refs(workflow)
+  inspect(refs.contains("changes"), content="true")
+  inspect(refs.contains("what"), content="false")
+}
+
+///|
+test "inspect: extract multiple output refs" {
+  let text = "name: Multi\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - uses: ./actions/skill\n        id: impl\n        with:\n          skill: dev/impl\n          inputs: data\n      - uses: ./actions/skill\n        with:\n          skill: dev/review\n          inputs: '{\"changes\": \"${{ steps.impl.outputs.changes }}\", \"summary\": \"${{ steps.impl.outputs.summary }}\"}'\n"
+  let parsed = @ar.parse_workflow_yaml(text)
+  guard parsed.workflow is Some(workflow) else {
+    abort("failed to parse: " + parsed.errors.join(", "))
+  }
+  let refs = extract_step_output_refs(workflow)
+  inspect(refs.contains("changes"), content="true")
+  inspect(refs.contains("summary"), content="true")
+}
+
+///|
+test "inspect: no output refs when no step references" {
+  let text = "name: Simple\non: push\njobs:\n  lint:\n    runs-on: local\n    steps:\n      - run: bun run lint\n"
+  let parsed = @ar.parse_workflow_yaml(text)
+  guard parsed.workflow is Some(workflow) else {
+    abort("failed to parse: " + parsed.errors.join(", "))
+  }
+  let refs = extract_step_output_refs(workflow)
+  inspect(refs.size(), content="0")
+}
+
+///|
+test "inspect: full integration with skill files" {
+  let test_dir = "_build/actrun/test_inspect"
+  ensure_main_test_dir("_build")
+  ensure_main_test_dir("_build/actrun")
+  ensure_main_test_dir(test_dir)
+  ensure_main_test_dir(test_dir + "/skills")
+  ensure_main_test_dir(test_dir + "/skills/dev")
+
+  // Create skill files
+  @xfs.write_string_to_file(
+    test_dir + "/skills/dev/impl.md",
+    "---\ninputs:\n  what: Implementation details\n  where:\n    description: Target file\n    type: plain\n---\n\nDo the work.",
+  )
+  @xfs.write_string_to_file(
+    test_dir + "/skills/dev/review.md",
+    "---\ninputs:\n  changes: Changed files\n---\n\nReview.",
+  )
+
+  // Create workflow
+  let workflow_text = "name: Implement\non: push\njobs:\n  build:\n    runs-on: local\n    steps:\n      - uses: ./actions/skill\n        id: impl\n        with:\n          skill: dev/impl\n          inputs: data\n      - uses: ./actions/skill\n        with:\n          skill: dev/review\n          inputs: '{\"changes\": \"${{ steps.impl.outputs.changes }}\"}'\n"
+
+  let parsed = @ar.parse_workflow_yaml(workflow_text)
+  guard parsed.workflow is Some(workflow) else {
+    abort("failed to parse: " + parsed.errors.join(", "))
+  }
+
+  // Collect all skill inputs
+  let all_inputs : Map[String, String] = {}
+  for job in workflow.jobs {
+    for step in job.steps {
+      match step.uses {
+        Some(uses) => {
+          if uses.contains("actions/skill") {
+            let skill_name = step.with_values.get("skill").unwrap_or("")
+            if skill_name.length() > 0 {
+              let skill_path = test_dir + "/skills/" + skill_name + ".md"
+              let skill_text = read_text(skill_path)
+              match skill_text {
+                Some(content) => {
+                  let skill_inputs = parse_skill_frontmatter_inputs(content)
+                  for entry in skill_inputs {
+                    if not(all_inputs.contains(entry.0)) {
+                      all_inputs[entry.0] = entry.1
+                    }
+                  }
+                }
+                None => ()
+              }
+            }
+          }
+        }
+        None => ()
+      }
+    }
+  }
+
+  // Extract supplied outputs
+  let supplied = extract_step_output_refs(workflow)
+
+  // Required = all - supplied
+  let required : Map[String, String] = {}
+  for entry in all_inputs {
+    if not(supplied.contains(entry.0)) {
+      required[entry.0] = entry.1
+    }
+  }
+
+  // what and where are required (not supplied by wiring)
+  inspect(required.contains("what"), content="true")
+  inspect(required.contains("where"), content="true")
+  inspect(required.get("what"), content="Some(\"evidenced\")")
+  inspect(required.get("where"), content="Some(\"plain\")")
+
+  // changes is supplied by steps.impl.outputs.changes
+  inspect(required.contains("changes"), content="false")
+
+  // Cleanup
+  remove_main_test_tree(test_dir)
+}
